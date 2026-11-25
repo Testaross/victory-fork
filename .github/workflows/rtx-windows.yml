@@ -51,6 +51,32 @@ jobs:
           }
           cargo test --locked -p victory-gpu raw_memory_range_tests
           exit $LASTEXITCODE
+      - name: Verify rendering and safety regression coverage
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked -p victory-gpu -p victory-shader -p victory-hle -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $expected = @(
+            'stable_numbers_distinguish_allocation_identity',
+            'capacity_rejects_only_new_copies',
+            'write_ranges_preserve_order_identity_and_overlaps',
+            'dirty_ranges_reuse_storage_and_preserve_exact_coverage',
+            'coalesced_send_journal_protects_the_same_bytes',
+            'inline_requires_tier_1_1',
+            'synthetic_triangle_descriptor_is_unindexed',
+            'connect_list_rejects_invalid_counts_and_unreadable_header',
+            'partial_texture_retry_is_due_even_without_new_writes',
+            'first_lane_predicate_must_be_required_not_merely_present'
+          )
+          foreach ($test in $expected) {
+            if (-not ($tests -match "$($test): test")) {
+              throw "Missing regression test: $test"
+            }
+          }
+          cargo test --locked -p victory-shader first_lane_predicate_must_be_required_not_merely_present
+          exit $LASTEXITCODE
+      - name: Workspace tests
+        run: cargo test --locked --workspace
       - name: Build diagnostic executable
         run: cargo build --locked --profile diag -p victory --features diagnostics
       - name: Upload diagnostic executable
@@ -69,5 +95,3 @@ jobs:
           path: target/release/victory.exe
           if-no-files-found: error
           retention-days: 7
-      - name: Workspace tests
-        run: cargo test --locked --workspace
