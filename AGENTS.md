@@ -59,3 +59,16 @@ build is not a hardware or gameplay pass. Report actual failures, skips,
 device removal, shader rejections, and remaining gaps. Avoid claiming 30/60 FPS
 or working ray-tracing without measurements. Keep experimental flags opt-in.
 Do not merge to main or submit upstream PRs without explicit owner direction.
+
+## Experimental texture submission path
+
+`VICTORY_TEXTURE_SUBMISSION=1` opts into submission-time texture uploads
+and per-host-copy GPU ownership. Use synchronous submission (late wait and
+relay off); the default renderer is unchanged. The prelude captures separate
+upload buffers for each list and decides whether title data may replace the
+host texture in submission order. Copies initialize title-owned destinations
+before partial writes. This is a candidate, not a validated hardware fix.
+The policy unit test does not substitute for reverse-order pixel readback.
+Known gaps include alias/twin interactions, intra-list CPU writes, and
+GPU-written textures later modified by the CPU; verify these before enabling
+the path by default. Snapshot allocations may increase memory and CPU cost.

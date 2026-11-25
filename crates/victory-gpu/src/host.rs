@@ -1647,6 +1647,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Texture upload and ownership intents, evaluated at submission.
+    texture_uploads: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::texture::Staging>)>,
+    texture_writes: Vec<std::sync::Arc<crate::resource::HostTexture>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4846,6 +4849,22 @@ impl HostList {
             u.twin.behind.store(left, Ordering::Relaxed);
         }
         drop(twins);
+        // Capture each list's texture data before any later list refreshes
+        // the same staging buffer. Do not hold the deferred lock while
+        // allocating list-owned upload memory.
+        let (uploads, writes) = {
+            let d = self.deferred();
+            (d.texture_uploads.clone(), d.texture_writes.clone())
+        };
+        let mut snapshots = Vec::new();
+        for (copy, staging) in uploads {
+            let key = std::sync::Arc::as_ptr(&copy) as usize;
+            if states.contains_key(&key)
+                && let Some(buffer) = staging.submission_snapshot(self, &copy)
+            {
+                snapshots.push((copy, staging, buffer));
+            }
+        }
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
@@ -4878,13 +4897,26 @@ impl HostList {
                 }
             }
         }
+        for (copy, _, _) in &snapshots {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+            }
+            copying.insert(key, COPY_DEST);
+        }
+        // Ownership advances in submission order, even for lists that
+        // require no prelude barriers. Abandoned recordings never get here.
+        for copy in writes {
+            copy.gpu_written.store(true, Ordering::Relaxed);
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && snapshots.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -4904,6 +4936,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (copy, staging, buffer) in &snapshots {
+                    staging.record_snapshot(list, &copy.texture, buffer);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5215,6 +5250,14 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    pub(crate) fn defer_texture_upload(&self, copy: std::sync::Arc<crate::resource::HostTexture>, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().texture_uploads.push((copy, staging));
+    }
+
+    pub(crate) fn defer_texture_write(&self, copy: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().texture_writes.push(copy);
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

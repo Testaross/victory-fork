@@ -469,8 +469,32 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
+/// Experimental submission-ordered uploads, initially for synchronous
+/// operation only. The legacy path remains the default.
+pub(crate) fn submission_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let requested = std::env::var_os("VICTORY_TEXTURE_SUBMISSION").is_some_and(|v| v == "1");
+        if requested && crate::host::late() {
+            tracing::warn!("submission texture uploads require VICTORY_LATE_WAIT=0 and relay off");
+            return false;
+        }
+        requested
+    })
+}
+
 /// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
+pub(crate) fn host_written(list: &HostList, resource: This) {
+    if submission_uploads() {
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            // A partial copy needs the destination's original texels too.
+            if title_written(&copy.texture) {
+                upload(list, resource, &copy.texture);
+            }
+            list.defer_texture_write(copy);
+        }
+        return;
+    }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
@@ -516,6 +540,17 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    if submission_uploads() {
+        if !list.first_use(resource as usize) {
+            return;
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else { return };
+        let Some(staging) = staging(resource, texture) else { return };
+        staging.used.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
+        list.defer_texture(staging.clone());
+        list.defer_texture_upload(copy, staging);
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -622,7 +657,50 @@ fn staging_span(total: usize, offset: usize, pitch: usize, rows: usize, depth: u
     (len > 0 && len <= isize::MAX as usize).then_some((len, depth_pitch))
 }
 
+/// Only title-owned content may be initialized or refreshed from staging.
+pub(crate) fn upload_due(host_written: bool, uploaded: bool, dirty: bool) -> bool {
+    !host_written && (!uploaded || dirty)
+}
+
 impl Staging {
+    /// Capture the upload bytes now, rather than share mutable staging
+    /// memory with other lists prepared before ExecuteCommandLists.
+    pub(crate) fn submission_snapshot(&self, list: &HostList, copy: &crate::resource::HostTexture) -> Option<ID3D12Resource> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !upload_due(copy.gpu_written.load(Relaxed), self.uploaded.load(Relaxed), self.dirty.load(Relaxed)) {
+            return None;
+        }
+        let host = host()?;
+        let (buffer, data) = list.upload(host, self.bytes)?;
+        // SAFETY: both allocations are live and disjoint, and refreshes
+        // are serialized by the submission lock and staging mutex.
+        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::ptr::copy_nonoverlapping(self.data, data, self.bytes as usize) };
+        Some(buffer)
+    }
+
+    pub(crate) fn record_snapshot(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, buffer: &ID3D12Resource) {
+        for (i, footprint) in self.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed COM pointer, as in the legacy path.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed COM pointer; list retains the snapshot.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+            };
+            // SAFETY: the prelude transitions the destination to COPY_DEST.
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -1145,7 +1223,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::{Last, staging_span, with_title};
+    use super::{Last, staging_span, upload_due, with_title};
+
+    #[test]
+    fn submitted_gpu_writes_prevent_stale_title_uploads() {
+        // The upload decision is made against submitted ownership, not
+        // which list was recorded first. A discarded list changes nothing.
+        assert!(upload_due(false, false, true));
+        assert!(!upload_due(false, true, false));
+        assert!(upload_due(false, true, true));
+        assert!(!upload_due(true, false, true));
+        assert!(!upload_due(true, true, true));
+    }
 
     #[test]
     fn watched_refresh_invalidates_previous_texture_hash() {

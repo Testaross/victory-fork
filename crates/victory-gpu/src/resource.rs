@@ -1120,6 +1120,8 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// GPU ownership, advanced only at submission by the experimental path.
+    pub(crate) gpu_written: std::sync::atomic::AtomicBool,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1431,6 +1433,7 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                    && !host.gpu_written.load(Relaxed)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1548,6 +1551,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            gpu_written: std::sync::atomic::AtomicBool::new(false),
             bytes,
             filled: false,
         }
