@@ -303,34 +303,44 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
+                let ranges = joined(std::mem::take(&mut *dirty));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
+                    // Journal exactly the bytes of this send, once. Never
+                    // combine entries from distinct submission numbers.
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
                 }
                 ranges
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow, ranges));
         }
         true
     });
     out
 }
 
-/// Ranges in order, those that overlap or touch as one.
+/// Ranges in order, those that overlap or touch as one. Compact the
+/// existing allocation rather than allocating a second vector per send.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut used = 1;
+    for read in 1..ranges.len() {
+        let (from, to) = ranges[read];
+        if from <= ranges[used - 1].1 {
+            ranges[used - 1].1 = ranges[used - 1].1.max(to);
+        } else {
+            ranges[used] = (from, to);
+            used += 1;
         }
     }
-    out
+    ranges.truncate(used);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -389,7 +399,7 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs, outside};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -449,6 +459,36 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn dirty_ranges_reuse_storage_and_preserve_exact_coverage() {
+        let input = vec![(10, 20), (2, 7), (4, 5), (10, 20), (20, 23), (25, 27)];
+        let storage = input.as_ptr();
+        let coverage = |ranges: &[(usize, usize)]| {
+            (0..32).map(|i| ranges.iter().any(|&(a, b)| a <= i && i < b)).collect::<Vec<_>>()
+        };
+        let expected = coverage(&input);
+        let merged = joined(input);
+        assert_eq!(merged.as_ptr(), storage);
+        assert_eq!(merged, [(2, 7), (10, 23), (25, 27)]);
+        assert_eq!(coverage(&merged), expected);
+    }
+
+    #[test]
+    fn coalesced_send_journal_protects_the_same_bytes() {
+        let sends = [
+            (7, vec![(1, 8), (4, 10), (12, 15)]),
+            (8, vec![(0, 3), (10, 12), (11, 14)]),
+            (9, vec![(6, 9), (20, 21)]),
+        ];
+        for fetched_after in [6, 7, 8, 9] {
+            let original = sends.iter().filter(|(n, _)| *n > fetched_after)
+                .flat_map(|(_, ranges)| ranges.iter().copied()).collect();
+            let compacted = sends.iter().filter(|(n, _)| *n > fetched_after)
+                .flat_map(|(_, ranges)| joined(ranges.clone())).collect();
+            assert_eq!(outside(0, 24, original), outside(0, 24, compacted));
+        }
     }
 }
 
