@@ -297,6 +297,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// The approximate Wave32 fallback is not appropriate for a builder.
+fn strict_local_waves(builder: bool, setting: Option<&std::ffi::OsStr>) -> bool {
+    builder || setting.is_some_and(|v| v == "idiom")
+}
+
+#[cfg(test)]
+#[test]
+fn builder_never_uses_approximate_local_waves() {
+    use std::ffi::OsStr;
+    for value in [None, Some(OsStr::new("0")), Some(OsStr::new("1")), Some(OsStr::new("idiom"))] {
+        assert!(strict_local_waves(true, value));
+    }
+    assert!(!strict_local_waves(false, None));
+    assert!(!strict_local_waves(false, Some(OsStr::new("1"))));
+    assert!(strict_local_waves(false, Some(OsStr::new("idiom"))));
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -341,7 +358,14 @@ pub fn emit(
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        // Builder shaders write raw title memory; a plausible-looking
+        // half-wave result may corrupt BVH indices and unrelated objects.
+        // Keep the exact allocation idiom, but never use the approximate
+        // fallback for a spilled builder program.
+        let strict = strict_local_waves(
+            crate::spill::is_spilled(native),
+            std::env::var_os("VICTORY_WAVE_LOCAL").as_deref(),
+        );
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {

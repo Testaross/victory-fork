@@ -69,6 +69,12 @@ struct Last {
 }
 
 impl Last {
+    /// A write-watch refresh changes the staging bytes without computing
+    /// their hash. Invalidate the old hash before later hashed refreshes.
+    fn unhashed_refresh(&mut self) {
+        self.hash = None;
+    }
+
     /// Recheck a partial texture after the retry interval even if the
     /// write-watch has no new writes. Mapping a mip need not write bytes.
     fn partial_due(&self, frame: u64) -> bool {
@@ -652,6 +658,7 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            last.unhashed_refresh();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -1139,6 +1146,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::{Last, staging_span, with_title};
+
+    #[test]
+    fn watched_refresh_invalidates_previous_texture_hash() {
+        let a = blake3::hash(b"original");
+        let b = blake3::hash(b"updated");
+        let mut last = Last { hash: Some(a), asked: 42, partial: None };
+        // A watched refresh changes the staging bytes to b, with no hash.
+        last.unhashed_refresh();
+        assert_ne!(last.hash, Some(a), "returning to original bytes must detile");
+        assert_ne!(last.hash, Some(b));
+        assert_eq!(last.asked, 42);
+        // A subsequent hashed refresh can remember its actual bytes again.
+        last.hash = Some(a);
+        assert_eq!(last.hash, Some(a));
+    }
 
     #[test]
     fn staging_span_excludes_unallocated_final_row_padding() {

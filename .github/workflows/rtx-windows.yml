@@ -66,7 +66,10 @@ jobs:
             'synthetic_triangle_descriptor_is_unindexed',
             'connect_list_rejects_invalid_counts_and_unreadable_header',
             'partial_texture_retry_is_due_even_without_new_writes',
-            'first_lane_predicate_must_be_required_not_merely_present'
+            'first_lane_predicate_must_be_required_not_merely_present',
+            'staging_span_excludes_unallocated_final_row_padding',
+            'watched_refresh_invalidates_previous_texture_hash',
+            'builder_never_uses_approximate_local_waves'
           )
           foreach ($test in $expected) {
             if (-not ($tests -match "$($test): test")) {
