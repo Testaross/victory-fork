@@ -1,0 +1,73 @@
+name: VIctory RTX Windows builds
+
+on:
+  push:
+    branches:
+      - victory-rtx-**
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtx-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: GPU memory registration regression tests
+        shell: pwsh
+        run: |
+          $tests = cargo test --locked -p victory-gpu raw_memory_range_tests -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests | Write-Output
+          $expected = @(
+            'interleaved_lists_register_each_others_new_copies',
+            'reading_does_not_register_writes',
+            'deferred_default_resets_watermarks'
+          )
+          foreach ($test in $expected) {
+            if (-not ($tests -match "$($test): test")) {
+              throw "Missing regression test: $test"
+            }
+          }
+          cargo test --locked -p victory-gpu raw_memory_range_tests
+          exit $LASTEXITCODE
+      - name: Build diagnostic executable
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: Upload diagnostic executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-rtx-windows-x64-diag
+          path: target/diag/victory.exe
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build release executable
+        run: cargo build --locked --release -p victory
+      - name: Upload release executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-rtx-windows-x64-release
+          path: target/release/victory.exe
+          if-no-files-found: error
+          retention-days: 7
+      - name: Workspace tests
+        run: cargo test --locked --workspace
