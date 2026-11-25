@@ -291,9 +291,45 @@ pub extern "system" fn WSAConnectByNameW(
 /// `SOCKET_ADDRESS`; a `SOCKET_ADDRESS_LIST` is an `i32` count, then these
 /// (pointer aligned).
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SocketAddress {
     addr: *const u8,
     len: i32,
+}
+
+const MAX_CONNECT_ADDRESSES: usize = 64;
+const MAX_SOCKADDR_BYTES: usize = 128;
+
+#[repr(C)]
+struct ConnectList {
+    count: i32,
+    entries: [SocketAddress; MAX_CONNECT_ADDRESSES],
+}
+
+// A checked OS copy instead of forming a Rust reference to title memory.
+// An unreadable or concurrently unmapped address is a failed call.
+fn read_connect_bytes(address: usize, bytes: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if address == 0 || address.checked_add(bytes.len()).is_none() {
+        return false;
+    }
+    let mut read = 0;
+    // SAFETY: the OS checks the source; destination is a valid slice.
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), address as *const c_void,
+            bytes.as_mut_ptr().cast(), bytes.len(), &mut read) != 0
+            && read == bytes.len()
+    }
+}
+
+fn connect_count(list: usize) -> Option<usize> {
+    let mut bytes = [0; 4];
+    if !read_connect_bytes(list, &mut bytes) {
+        return None;
+    }
+    let count = usize::try_from(i32::from_ne_bytes(bytes)).ok()?;
+    (1..=MAX_CONNECT_ADDRESSES).contains(&count).then_some(count)
 }
 
 /// Every candidate must be loopback.
@@ -307,21 +343,47 @@ pub extern "system" fn WSAConnectByList(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
+    let invalid = || {
+        wsa_error(WSAEINVAL);
+        0
+    };
+    let Some(count) = connect_count(list as usize) else {
+        return invalid();
+    };
+    let mut checked = ConnectList {
+        count: count as i32,
+        entries: [SocketAddress { addr: std::ptr::null(), len: 0 }; MAX_CONNECT_ADDRESSES],
+    };
+    let mut addresses = [[0u8; MAX_SOCKADDR_BYTES]; MAX_CONNECT_ADDRESSES];
+    for (i, dest) in addresses[..count].iter_mut().enumerate() {
+        let Some(at) = (list as usize).checked_add(
+            std::mem::offset_of!(ConnectList, entries) + i * std::mem::size_of::<SocketAddress>()
+        ) else {
+            return invalid();
         };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
+        // x64 SOCKET_ADDRESS: pointer, signed length, alignment padding.
+        let mut entry = [0u8; std::mem::size_of::<SocketAddress>()];
+        if !read_connect_bytes(at, &mut entry) {
+            return invalid();
+        }
+        let ptr_size = std::mem::size_of::<usize>();
+        let address = usize::from_ne_bytes(entry[..ptr_size].try_into().unwrap());
+        let len = i32::from_ne_bytes(entry[ptr_size..ptr_size + 4].try_into().unwrap());
+        let Ok(n) = usize::try_from(len) else {
+            return invalid();
+        };
+        if !(4..=MAX_SOCKADDR_BYTES).contains(&n) || !read_connect_bytes(address, &mut dest[..n]) {
+            return invalid();
+        }
+        if !reachable("network connect blocked", dest.as_ptr(), len) {
             return 0;
         }
+        checked.entries[i] = SocketAddress { addr: dest.as_ptr(), len };
     }
+    // Forward only the local, vetted copy. The caller cannot change an
+    // address between the loopback check and the host's use of it.
     host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
+        s, (&raw const checked).cast(), local_len, local, remote_len, remote, timeout, reserved,
     )
 }
 
@@ -882,6 +944,18 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
+
+    #[test]
+    fn connect_list_rejects_invalid_counts_and_unreadable_header() {
+        for n in [i32::MIN, -1, 0, 65, i32::MAX] {
+            assert_eq!(connect_count((&raw const n) as usize), None);
+        }
+        for n in [1i32, 64] {
+            assert_eq!(connect_count((&raw const n) as usize), Some(n as usize));
+        }
+        assert_eq!(connect_count(0), None);
+        assert_eq!(connect_count(1), None);
+    }
 
     fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
         let mut a = [0u8; 16];
