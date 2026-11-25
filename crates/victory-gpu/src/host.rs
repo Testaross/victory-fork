@@ -807,6 +807,37 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+/// Reserve a packed D3D12 texture placement (512-byte alignment).
+/// On failure leave the cursor unchanged.
+fn reserve_texture_snapshot(cursor: &mut u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 {
+        return None;
+    }
+    let offset = cursor.checked_add(511)? & !511;
+    let end = offset.checked_add(bytes)?;
+    if end > isize::MAX as u64 {
+        return None;
+    }
+    *cursor = end;
+    Some(offset)
+}
+
+#[cfg(test)]
+#[test]
+fn packed_texture_snapshots_are_aligned_disjoint_and_checked() {
+    let mut cursor = 0;
+    assert_eq!(reserve_texture_snapshot(&mut cursor, 896), Some(0));
+    assert_eq!(reserve_texture_snapshot(&mut cursor, 1920), Some(1024));
+    assert_eq!(reserve_texture_snapshot(&mut cursor, 1), Some(3072));
+    assert_eq!(cursor, 3073);
+    assert_eq!(reserve_texture_snapshot(&mut cursor, 0), None);
+    assert_eq!(reserve_texture_snapshot(&mut cursor, u64::MAX), None);
+    assert_eq!(cursor, 3073);
+    let mut overflow = u64::MAX - 1;
+    assert_eq!(reserve_texture_snapshot(&mut overflow, 1), None);
+    assert_eq!(overflow, u64::MAX - 1);
+}
+
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
@@ -4857,14 +4888,35 @@ impl HostList {
             (d.texture_uploads.clone(), d.texture_writes.clone())
         };
         let mut snapshots = Vec::new();
+        let mut snapshot_size = 0;
+        let mut seen = std::collections::HashSet::new();
         for (copy, staging) in uploads {
             let key = std::sync::Arc::as_ptr(&copy) as usize;
             if states.contains_key(&key)
-                && let Some(buffer) = staging.submission_snapshot(self, &copy)
+                && seen.insert(key)
+                && let Some(bytes) = staging.snapshot_bytes(&copy)
             {
-                snapshots.push((copy, staging, buffer));
+                let offset = reserve_texture_snapshot(&mut snapshot_size, bytes)
+                    .unwrap_or_else(|| fail(format_args!("invalid texture snapshot size")));
+                snapshots.push((copy, staging, offset));
             }
         }
+        // One upload resource per prelude rather than one per texture.
+        // It is retained by the list, with non-overlapping 512-byte
+        // aligned footprints, until the recording is reset.
+        let snapshot_buffer = if snapshot_size == 0 {
+            None
+        } else {
+            let host = host().unwrap_or_else(|| fail(format_args!("no host for texture snapshots")));
+            let (buffer, data) = self.upload(host, snapshot_size)
+                .unwrap_or_else(|| fail(format_args!("texture snapshot allocation failed ({snapshot_size} bytes)")));
+            for (_, staging, offset) in &snapshots {
+                // SAFETY: reserve_texture_snapshot bounded every span
+                // within the allocation; the staging buffers are distinct.
+                unsafe { staging.copy_snapshot(data.add(*offset as usize)) };
+            }
+            Some(buffer)
+        };
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
@@ -4897,11 +4949,12 @@ impl HostList {
                 }
             }
         }
+        let mut to_upload = Vec::new();
         for (copy, _, _) in &snapshots {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
             if real != COPY_DEST {
-                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                to_upload.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
             }
             copying.insert(key, COPY_DEST);
         }
@@ -4937,8 +4990,15 @@ impl HostList {
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                for (copy, staging, buffer) in &snapshots {
-                    staging.record_snapshot(list, &copy.texture, buffer);
+                // Twin copies must finish before changing their states
+                // for the title-owned uploads.
+                if !to_upload.is_empty() {
+                    list.ResourceBarrier(&to_upload);
+                }
+                if let Some(buffer) = &snapshot_buffer {
+                    for (copy, staging, offset) in &snapshots {
+                        staging.record_snapshot(list, &copy.texture, buffer, *offset);
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);

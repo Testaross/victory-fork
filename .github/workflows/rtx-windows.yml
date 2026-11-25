@@ -69,7 +69,9 @@ jobs:
             'first_lane_predicate_must_be_required_not_merely_present',
             'staging_span_excludes_unallocated_final_row_padding',
             'watched_refresh_invalidates_previous_texture_hash',
-            'builder_never_uses_approximate_local_waves'
+            'builder_never_uses_approximate_local_waves',
+            'submitted_gpu_writes_prevent_stale_title_uploads',
+            'packed_texture_snapshots_are_aligned_disjoint_and_checked'
           )
           foreach ($test in $expected) {
             if (-not ($tests -match "$($test): test")) {

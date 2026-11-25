@@ -663,23 +663,22 @@ pub(crate) fn upload_due(host_written: bool, uploaded: bool, dirty: bool) -> boo
 }
 
 impl Staging {
-    /// Capture the upload bytes now, rather than share mutable staging
-    /// memory with other lists prepared before ExecuteCommandLists.
-    pub(crate) fn submission_snapshot(&self, list: &HostList, copy: &crate::resource::HostTexture) -> Option<ID3D12Resource> {
+    /// Bytes needed for an upload at this point in submission order.
+    pub(crate) fn snapshot_bytes(&self, copy: &crate::resource::HostTexture) -> Option<u64> {
         use std::sync::atomic::Ordering::Relaxed;
-        if !upload_due(copy.gpu_written.load(Relaxed), self.uploaded.load(Relaxed), self.dirty.load(Relaxed)) {
-            return None;
-        }
-        let host = host()?;
-        let (buffer, data) = list.upload(host, self.bytes)?;
-        // SAFETY: both allocations are live and disjoint, and refreshes
-        // are serialized by the submission lock and staging mutex.
-        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::ptr::copy_nonoverlapping(self.data, data, self.bytes as usize) };
-        Some(buffer)
+        upload_due(copy.gpu_written.load(Relaxed), self.uploaded.load(Relaxed), self.dirty.load(Relaxed))
+            .then_some(self.bytes)
     }
 
-    pub(crate) fn record_snapshot(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, buffer: &ID3D12Resource) {
+    /// SAFETY: dest must point to a live, disjoint upload allocation
+    /// with at least self.bytes writable bytes.
+    pub(crate) unsafe fn copy_snapshot(&self, dest: *mut u8) {
+        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guaranteed by caller; staging refresh is serialized.
+        unsafe { std::ptr::copy_nonoverlapping(self.data, dest, self.bytes as usize) };
+    }
+
+    pub(crate) fn record_snapshot(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, buffer: &ID3D12Resource, offset: u64) {
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: borrowed COM pointer, as in the legacy path.
@@ -687,11 +686,13 @@ impl Staging {
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
             };
+            let mut placed = *footprint;
+            placed.Offset += offset;
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: borrowed COM pointer; list retains the snapshot.
                 pResource: unsafe { std::mem::transmute_copy(buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
             };
             // SAFETY: the prelude transitions the destination to COPY_DEST.
             unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };

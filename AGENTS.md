@@ -72,3 +72,10 @@ The policy unit test does not substitute for reverse-order pixel readback.
 Known gaps include alias/twin interactions, intra-list CPU writes, and
 GPU-written textures later modified by the CPU; verify these before enabling
 the path by default. Snapshot allocations may increase memory and CPU cost.
+
+The texture-pack branch combines all due texture snapshots for a prelude
+into a single upload buffer using checked 512-byte aligned offsets.
+The buffer remains live until list reset. Allocation failures are fatal
+rather than silently skipping due uploads. Twin-copy transitions precede
+snapshot transitions. Measure allocation counts and memory retention on a
+physical GPU; this is not yet a performance benchmark.
