@@ -1630,6 +1630,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    /// Raw-address copies already registered with this recording.
+    raw_memory: RawMemoryRanges,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1654,6 +1656,57 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+/// The raw-address directory only grows. Track its registered prefix on
+/// each command list, independently for refresh and write-back.
+#[derive(Default)]
+struct RawMemoryRanges {
+    reads: usize,
+    writes: usize,
+}
+
+impl RawMemoryRanges {
+    fn advance(&mut self, count: usize, writes: bool) -> (usize, usize) {
+        let previous = (self.reads, self.writes);
+        self.reads = count;
+        if writes {
+            self.writes = count;
+        }
+        previous
+    }
+}
+
+#[cfg(test)]
+mod raw_memory_range_tests {
+    use super::{Deferred, RawMemoryRanges};
+
+    #[test]
+    fn interleaved_lists_register_each_others_new_copies() {
+        let mut a = RawMemoryRanges::default();
+        let mut b = RawMemoryRanges::default();
+        assert_eq!(a.advance(2, true), (0, 0));
+        assert_eq!(b.advance(3, true), (0, 0));
+        assert_eq!(a.advance(3, true), (2, 2));
+    }
+
+    #[test]
+    fn reading_does_not_register_writes() {
+        let mut a = RawMemoryRanges::default();
+        assert_eq!(a.advance(2, false), (0, 0));
+        assert_eq!(a.advance(3, true), (2, 0));
+        assert_eq!(a.advance(4, false), (3, 3));
+        assert_eq!(a.advance(4, true), (4, 3));
+        assert_eq!(a.advance(4, true), (4, 4));
+    }
+
+    #[test]
+    fn deferred_default_resets_watermarks() {
+        let mut d = Deferred::default();
+        d.raw_memory.advance(3, true);
+        d = Deferred::default();
+        assert_eq!(d.raw_memory.advance(3, true), (0, 0));
+    }
 }
 
 impl Deferred {
@@ -5103,6 +5156,11 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Previous read and write registration prefixes for this list.
+    pub(crate) fn raw_memory_ranges(&self, count: usize, writes: bool) -> (usize, usize) {
+        self.deferred().raw_memory.advance(count, writes)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
