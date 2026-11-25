@@ -68,6 +68,14 @@ struct Last {
     partial: Option<u64>,
 }
 
+impl Last {
+    /// Recheck a partial texture after the retry interval even if the
+    /// write-watch has no new writes. Mapping a mip need not write bytes.
+    fn partial_due(&self, frame: u64) -> bool {
+        self.partial.is_some_and(|at| frame.wrapping_sub(at) >= 30)
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -624,8 +632,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        let partial_due = last.partial_due(crate::frame::current());
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !partial_due && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -635,6 +644,7 @@ impl Staging {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
             });
+            last.partial = None;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -650,6 +660,7 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut mapping_or_write_changed = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -657,7 +668,8 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            mapping_or_write_changed = !unwritten;
+            if unwritten && !turn && !partial_due {
                 return 0;
             }
         }
@@ -687,7 +699,7 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !mapping_or_write_changed && last.partial.is_some() && !partial_due {
                 return 0;
             }
             last.partial = Some(frame);
@@ -699,10 +711,14 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
+                // A wholly zero partial read is deliberately not uploaded.
+                // Do not remember it as the hash of the staging bytes:
+                // when the complete texture maps with those same bytes,
+                // it still needs to replace the old texture.
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
+                last.hash = Some(hash);
                 self.detile(read);
                 true
             });
@@ -713,6 +729,7 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        last.partial = None;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -764,6 +781,7 @@ impl Staging {
             true
         });
         if read {
+            last.partial = None;
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
         } else {
@@ -1100,7 +1118,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{Last, with_title};
+
+    #[test]
+    fn partial_texture_retry_is_due_even_without_new_writes() {
+        let mut last = Last::default();
+        assert!(!last.partial_due(100));
+        last.partial = Some(100);
+        assert!(!last.partial_due(129));
+        assert!(last.partial_due(130));
+        assert!(last.partial_due(131));
+        last.partial = Some(u64::MAX - 10);
+        assert!(last.partial_due(19));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
