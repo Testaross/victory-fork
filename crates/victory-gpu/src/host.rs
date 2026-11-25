@@ -2717,26 +2717,78 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// Index declared ranges by allocation identity and exact range, while
+/// retaining the first-seen order of both copies and ranges.
+struct WriteRanges<T> {
+    groups: Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)>,
+    indices: std::collections::HashMap<usize, usize>,
+    seen: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl<T> WriteRanges<T> {
+    fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            indices: std::collections::HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, copy: &std::sync::Arc<T>, range: (usize, usize)) {
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        if !self.seen.insert((key, range.0, range.1)) {
+            return;
+        }
+        let index = *self.indices.entry(key).or_insert_with(|| {
+            let index = self.groups.len();
+            self.groups.push((copy.clone(), Vec::new()));
+            index
+        });
+        self.groups[index].1.push(range);
+    }
+}
+
+#[cfg(test)]
+mod write_range_index_tests {
+    use super::WriteRanges;
+    use std::sync::Arc;
+
+    #[test]
+    fn write_ranges_preserve_order_identity_and_overlaps() {
+        let a = Arc::new(7);
+        let b = Arc::new(7);
+        let mut ranges = WriteRanges::new();
+        ranges.add(&a, (4, 12));
+        ranges.add(&b, (4, 12));
+        ranges.add(&a.clone(), (4, 12));
+        ranges.add(&a, (8, 16));
+        ranges.add(&a, (0, 4));
+        assert_eq!(ranges.groups.len(), 2);
+        assert!(Arc::ptr_eq(&ranges.groups[0].0, &a));
+        assert!(Arc::ptr_eq(&ranges.groups[1].0, &b));
+        assert_eq!(ranges.groups[0].1, [(4, 12), (8, 16), (0, 4)]);
+        assert_eq!(ranges.groups[1].1, [(4, 12)]);
+    }
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
-fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+fn collect_declared_writes(runs: &[&HostList], card_only: bool) -> Vec<Declared> {
+    let mut back = WriteRanges::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+            if let Step::GpuWrite(shadow, address, len) = step
+                && (!card_only || shadow.carded())
+            {
+                back.add(shadow, (*address, *address + *len));
             }
         }
     }
-    back
+    back.groups
+}
+
+fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    collect_declared_writes(runs, false)
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3079,25 +3131,8 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
-        // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        // The ranges this submission's shaders may write, per card copy.
+        let declared = collect_declared_writes(runs, true);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
