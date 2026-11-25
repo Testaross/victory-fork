@@ -62,12 +62,83 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+/// Stable copy numbers, indexed by allocation identity rather than scanning
+/// all numbered copies while holding the global memory lock. The Arc in
+/// entries keeps its address alive for the entire lifetime of the index.
+struct NumberedCopies<T> {
+    entries: Vec<Arc<T>>,
+    by_address: HashMap<usize, usize>,
+}
+
+impl<T> NumberedCopies<T> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            by_address: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, Arc<T>> {
+        self.entries.iter()
+    }
+
+    /// Returns the zero-based number and whether it was newly assigned.
+    fn number(&mut self, copy: &Arc<T>, limit: usize) -> Option<(usize, bool)> {
+        let key = Arc::as_ptr(copy) as usize;
+        if let Some(&number) = self.by_address.get(&key) {
+            return Some((number, false));
+        }
+        if self.entries.len() >= limit {
+            return None;
+        }
+        let number = self.entries.len();
+        self.entries.push(copy.clone());
+        self.by_address.insert(key, number);
+        Some((number, true))
+    }
+}
+
+#[cfg(test)]
+mod numbered_copy_tests {
+    use super::NumberedCopies;
+    use std::sync::Arc;
+
+    #[test]
+    fn stable_numbers_distinguish_allocation_identity() {
+        let mut copies = NumberedCopies::new();
+        let a = Arc::new(7);
+        let alias = a.clone();
+        let b = Arc::new(7);
+        assert_eq!(copies.number(&a, 2), Some((0, true)));
+        assert_eq!(copies.number(&b, 2), Some((1, true)));
+        assert_eq!(copies.number(&alias, 2), Some((0, false)));
+        assert!(Arc::ptr_eq(copies.iter().next().unwrap(), &a));
+        assert!(Arc::ptr_eq(copies.iter().nth(1).unwrap(), &b));
+    }
+
+    #[test]
+    fn capacity_rejects_only_new_copies() {
+        let mut copies = NumberedCopies::new();
+        let a = Arc::new(1);
+        let b = Arc::new(2);
+        assert_eq!(copies.number(&a, 0), None);
+        assert_eq!(copies.number(&a, 1), Some((0, true)));
+        assert_eq!(copies.number(&b, 1), None);
+        assert_eq!(copies.number(&a, 1), Some((0, false)));
+        assert_eq!(copies.len(), 1);
+    }
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    copies: NumberedCopies<Shadow>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -107,7 +178,7 @@ impl Memory {
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
-            copies: Vec::new(),
+            copies: NumberedCopies::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -152,11 +223,9 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
+        let n = match self.copies.number(&shadow, COPIES as usize) {
+            Some((n, false)) => n,
+            Some((n, true)) => {
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
