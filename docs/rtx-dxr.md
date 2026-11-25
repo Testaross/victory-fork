@@ -23,3 +23,17 @@ Next gates:
 Until those gates pass, do not enable native DXR for the title. Keep the
 existing BVH builder safety rules unchanged. Windows CI checks CPU-side
 descriptor and capability logic; it does not prove hardware rendering.
+
+## Driver compiler crash diagnosis
+
+For fxceless/victory-fork#422, set `VICTORY_VALIDATE_DXIL=1` before
+starting VIctory. The runtime checks translated shaders, even on cache
+hits, with the existing DXIL validator before they reach title pipeline
+creation. Rejected translations are logged with their title shader hash
+and stage through the existing failure path. If dxil.dll cannot load,
+strict mode rejects translations instead of silently proceeding.
+Use `VICTORY_DXIL` to specify a compatible validator DLL if needed.
+
+This mode is opt-in and may increase startup time or drop draws whose
+shaders were previously accepted. It does not repair invalid shaders or
+prove that the reported AMD crash is caused by invalid DXIL.

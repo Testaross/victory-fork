@@ -97,10 +97,33 @@ fn build() -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
+    }?;
+    validate_runtime(&shader.dxil)?;
+    Ok(shader)
+}
+
+/// Optional strict validation before any translated shader (including a
+/// cache hit) reaches pipeline creation. Leave normal runs unchanged.
+fn validate_runtime(dxil: &[u8]) -> Result<(), String> {
+    use victory_shader::emit::validator::Validator;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static VALIDATOR: OnceLock<Result<std::sync::Mutex<Validator>, String>> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_VALIDATE_DXIL").is_some_and(|v| v == "1")) {
+        return Ok(());
     }
+    let validator = VALIDATOR.get_or_init(|| {
+        Validator::load(Validator::default_path().as_deref()).map(std::sync::Mutex::new)
+    });
+    // Strict mode must not silently pass shaders if validation is unavailable.
+    let validator = validator.as_ref().map_err(|e| format!("DXIL validator unavailable: {e}"))?;
+    // The validator signs in place. Check a private copy so the cache and
+    // pipeline keys are unchanged, and serialize calls across workers.
+    let mut bytes = dxil.to_vec();
+    validator.lock().unwrap_or_else(|e| e.into_inner())
+        .validate(&mut bytes).map_err(|e| format!("DXIL validation rejected shader: {e}"))
 }
 
 /// The cache entry's converter: the build and the container in, the
