@@ -602,6 +602,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// The mapped upload allocation may end at the last row's actual bytes,
+/// without the final row's padding (GetCopyableFootprints). Do not create
+/// a Rust slice past that allocation, even if the detiler never touches it.
+fn staging_span(total: usize, offset: usize, pitch: usize, rows: usize, depth: usize) -> Option<(usize, usize)> {
+    if pitch == 0 || rows == 0 || depth == 0 {
+        return None;
+    }
+    let depth_pitch = pitch.checked_mul(rows)?;
+    let padded = depth_pitch.checked_mul(depth)?;
+    let remaining = total.checked_sub(offset)?;
+    let len = padded.min(remaining);
+    (len > 0 && len <= isize::MAX as usize).then_some((len, depth_pitch))
+}
+
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
@@ -806,14 +820,20 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let Some((len, depth_pitch)) = staging_span(
+                self.bytes as usize, footprint.Offset as usize, pitch, rows as usize, f.Depth as usize,
+            ) else {
+                tracing::warn!(mip, slice, "invalid texture staging span");
+                return;
+            };
+            // SAFETY: the span is bounded by the mapped allocation. The
+            // detiler validates the actual row bytes against this length.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, depth_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1118,7 +1138,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::{Last, with_title};
+    use super::{Last, staging_span, with_title};
+
+    #[test]
+    fn staging_span_excludes_unallocated_final_row_padding() {
+        assert_eq!(staging_span(896, 0, 256, 4, 1), Some((896, 1024)));
+        assert_eq!(staging_span(1920, 0, 256, 8, 1), Some((1920, 2048)));
+        assert_eq!(staging_span(2944, 1024, 256, 4, 2), Some((1920, 1024)));
+        assert_eq!(staging_span(4096, 512, 256, 4, 1), Some((1024, 1024)));
+        assert_eq!(staging_span(512, 513, 256, 4, 1), None);
+        assert_eq!(staging_span(512, 512, 256, 4, 1), None);
+        assert_eq!(staging_span(512, 0, usize::MAX, 2, 1), None);
+        assert_eq!(staging_span(512, 0, 256, 0, 1), None);
+    }
 
     #[test]
     fn partial_texture_retry_is_due_even_without_new_writes() {
